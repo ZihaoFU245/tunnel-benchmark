@@ -2,7 +2,7 @@
 
 all: build
 
-build: client server
+build: client server watcher
 
 client:
 	mkdir -p bin
@@ -11,6 +11,10 @@ client:
 server:
 	mkdir -p bin
 	go build -o bin/echoserver ./cmd/server/
+
+watcher:
+	mkdir -p bin
+	go build -o bin/watcher ./cmd/watcher/
 
 clean:
 	rm -rf bin/

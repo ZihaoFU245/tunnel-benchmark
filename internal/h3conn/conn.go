@@ -54,7 +54,7 @@ func dialQUIC(proxyAddr string) (*session, error) {
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"h3"},
-		ServerName:         "127.0.0.1",
+		ServerName:         "localhost",
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), settingsTimeout)

@@ -48,6 +48,7 @@ type session struct {
 	initWin          int32
 
 	framerMu sync.Mutex
+	hpackDec *hpack.Decoder
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -99,7 +100,7 @@ func newSession(proxyAddr string) (*session, error) {
 	tlsConn := tls.Client(rawConn, &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"h2"},
-		ServerName:         "127.0.0.1",
+		ServerName:         "localhost",
 	})
 
 	if err := tlsConn.Handshake(); err != nil {
@@ -124,6 +125,7 @@ func newSession(proxyAddr string) (*session, error) {
 		ctx:         ctx,
 		cancel:      cancel,
 		initWin:     defaultStreamWindow,
+		hpackDec:    hpack.NewDecoder(4096, nil),
 	}
 	s.writeCond = sync.NewCond(&s.mu)
 
@@ -262,7 +264,7 @@ func (s *session) readLoop() {
 				continue
 			}
 
-			hd := hpack.NewDecoder(4096, nil)
+			hd := s.hpackDec
 			hf, err := hd.DecodeFull(ff.HeaderBlockFragment())
 			if err != nil {
 				st.connectOnce.Do(func() { st.connectCh <- err })
