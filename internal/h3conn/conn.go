@@ -26,10 +26,11 @@ func PacketHeaderSize() int  { return hdrSize }
 func PacketPayloadSize() int { return payloadSize }
 
 type Conn struct {
-	rstr       *http3.RequestStream
-	quicConn   *quic.Conn
-	transport  *quic.Transport
-	clientConn *http3.ClientConn
+	rstr        *http3.RequestStream
+	quicConn    *quic.Conn
+	transport   *quic.Transport
+	clientConn  *http3.ClientConn
+	ownsSession bool
 
 	mu     sync.Mutex
 	closed bool
@@ -59,7 +60,13 @@ func dialQUIC(proxyAddr string) (*session, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), settingsTimeout)
 	defer cancel()
 
-	quicConn, err := tr.Dial(ctx, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3128}, tlsConf, &quic.Config{
+	proxyUDPAddr, err := net.ResolveUDPAddr("udp", proxyAddr)
+	if err != nil {
+		tr.Close()
+		return nil, fmt.Errorf("resolve proxy addr: %w", err)
+	}
+
+	quicConn, err := tr.Dial(ctx, proxyUDPAddr, tlsConf, &quic.Config{
 		MaxIdleTimeout: 30 * time.Second,
 	})
 	if err != nil {
@@ -155,13 +162,26 @@ func (c *Conn) Write(b []byte) (int, error) {
 
 func (c *Conn) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return nil
 	}
 	c.closed = true
-	c.rstr.CancelRead(0)
-	return c.rstr.Close()
+	ownsSession := c.ownsSession
+	transport := c.transport
+	_ = c.rstr.SetReadDeadline(time.Now())
+	err := c.rstr.Close()
+	c.mu.Unlock()
+
+	if ownsSession {
+		if closeErr := c.clientConn.CloseWithError(0, ""); err == nil {
+			err = closeErr
+		}
+		if closeErr := transport.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
 func Dial(proxyAddr, targetAddr string) (*Conn, error) {
@@ -175,5 +195,6 @@ func Dial(proxyAddr, targetAddr string) (*Conn, error) {
 		s.close()
 		return nil, err
 	}
+	conn.ownsSession = true
 	return conn, nil
 }

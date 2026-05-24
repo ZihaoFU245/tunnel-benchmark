@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -15,16 +16,15 @@ import (
 )
 
 const (
-	defaultStreamWindow  = 65535
-	defaultConnWindow    = 65535
-	initialConnRecvWin   = 64 << 20
-	connWinUpdateThresh  = 1 << 20
+	defaultStreamWindow   = 65535
+	defaultConnWindow     = 65535
+	initialConnRecvWin    = 64 << 20
+	connWinUpdateThresh   = 1 << 20
 	streamWinUpdateThresh = 32768
-	maxReadBuf           = 1 << 21
-	maxReadQueue         = 8 << 20
-	settingsTimeout      = 5 * time.Second
-	requestTimeout       = 10 * time.Second
-	maxFrameSize         = 16384
+	maxReadQueue          = 8 << 20
+	settingsTimeout       = 5 * time.Second
+	requestTimeout        = 10 * time.Second
+	maxFrameSize          = 16384
 
 	packetHeaderSizeVal  = 8
 	packetPayloadSizeVal = 1400
@@ -38,7 +38,7 @@ type session struct {
 	rawConn net.Conn
 	framer  *http2.Framer
 
-	mu               sync.Mutex
+	mu               sync.RWMutex
 	streams          map[uint32]*stream
 	connSendWin      int32
 	connRecvConsumed int32
@@ -58,23 +58,36 @@ type stream struct {
 	id uint32
 	s  *session
 
-	mu       sync.Mutex
-	readBuf  []byte
-	readErr  error
-	readCond *sync.Cond
+	mu        sync.Mutex
+	readQ     []readChunk
+	readBytes int
+	readErr   error
+	readCond  *sync.Cond
+	spaceCond *sync.Cond
 
 	sendWin int32
-	closed  bool
+	closed  atomic.Bool
 
 	connectCh    chan error
 	connectOnce  sync.Once
 	recvConsumed int32
 }
 
+type readChunk struct {
+	buf []byte
+	off int
+}
+
 type Conn struct {
 	st          *stream
 	ownsSession bool
 	closeOnce   sync.Once
+}
+
+var dataFrameBufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, maxFrameSize)
+	},
 }
 
 func newSession(proxyAddr string) (*session, error) {
@@ -204,6 +217,7 @@ func (s *session) readLoop() {
 						st.readErr = err
 					}
 					st.readCond.Broadcast()
+					st.spaceCond.Broadcast()
 					st.mu.Unlock()
 				}
 				s.mu.Unlock()
@@ -215,53 +229,35 @@ func (s *session) readLoop() {
 		switch ff := f.(type) {
 		case *http2.DataFrame:
 			data := ff.Data()
-			dataLen := int32(len(data))
+			dataLen := len(data)
 
-			s.mu.Lock()
+			s.mu.RLock()
 			st := s.streams[ff.StreamID]
-			s.connRecvConsumed += dataLen
-			s.mu.Unlock()
+			s.mu.RUnlock()
 
 			if st == nil {
 				continue
 			}
 
-			var streamInc uint32
 			st.mu.Lock()
-			if len(st.readBuf) < maxReadQueue {
-				st.readBuf = append(st.readBuf, data...)
-				st.readCond.Broadcast()
+			for st.readBytes+dataLen > maxReadQueue && st.readErr == nil && !st.closed.Load() && s.ctx.Err() == nil {
+				st.spaceCond.Wait()
 			}
-			st.recvConsumed += dataLen
-			if st.recvConsumed >= streamWinUpdateThresh {
-				streamInc = uint32(st.recvConsumed)
-				st.recvConsumed = 0
+			if st.readErr != nil || st.closed.Load() || s.ctx.Err() != nil {
+				st.mu.Unlock()
+				continue
 			}
+			buf := getDataFrameBuf(dataLen)
+			copy(buf, data)
+			st.readQ = append(st.readQ, readChunk{buf: buf})
+			st.readBytes += dataLen
+			st.readCond.Broadcast()
 			st.mu.Unlock()
 
-			s.mu.Lock()
-			var connInc uint32
-			if s.connRecvConsumed >= connWinUpdateThresh {
-				connInc = uint32(s.connRecvConsumed)
-				s.connRecvConsumed = 0
-			}
-			s.mu.Unlock()
-
-			if connInc > 0 || streamInc > 0 {
-				s.framerMu.Lock()
-				if connInc > 0 {
-					s.framer.WriteWindowUpdate(0, connInc)
-				}
-				if streamInc > 0 {
-					s.framer.WriteWindowUpdate(st.id, streamInc)
-				}
-				s.framerMu.Unlock()
-			}
-
 		case *http2.HeadersFrame:
-			s.mu.Lock()
+			s.mu.RLock()
 			st := s.streams[ff.StreamID]
-			s.mu.Unlock()
+			s.mu.RUnlock()
 			if st == nil || st.connectCh == nil {
 				continue
 			}
@@ -331,6 +327,7 @@ func (s *session) readLoop() {
 					st.readErr = fmt.Errorf("GOAWAY: %v", ff.ErrCode)
 				}
 				st.readCond.Broadcast()
+				st.spaceCond.Broadcast()
 				st.mu.Unlock()
 			}
 			s.mu.Unlock()
@@ -344,6 +341,7 @@ func (s *session) readLoop() {
 					st.readErr = fmt.Errorf("RST_STREAM: %v", ff.ErrCode)
 				}
 				st.readCond.Broadcast()
+				st.spaceCond.Broadcast()
 				st.mu.Unlock()
 			}
 			s.mu.Unlock()
@@ -358,6 +356,7 @@ func (s *session) dialStream(targetAddr string) (*stream, error) {
 		return nil, fmt.Errorf("session closed")
 	}
 	streamID := s.nextID
+	initWin := s.initWin
 	s.nextID += 2
 	s.mu.Unlock()
 
@@ -365,9 +364,10 @@ func (s *session) dialStream(targetAddr string) (*stream, error) {
 		id:        streamID,
 		s:         s,
 		connectCh: make(chan error, 1),
-		sendWin:   s.initWin,
+		sendWin:   initWin,
 	}
 	st.readCond = sync.NewCond(&st.mu)
+	st.spaceCond = sync.NewCond(&st.mu)
 
 	s.mu.Lock()
 	s.streams[streamID] = st
@@ -425,6 +425,7 @@ func (s *session) close() error {
 	for _, st := range s.streams {
 		st.mu.Lock()
 		st.readCond.Broadcast()
+		st.spaceCond.Broadcast()
 		st.mu.Unlock()
 	}
 	s.mu.Unlock()
@@ -438,24 +439,43 @@ func (c *Conn) Read(b []byte) (int, error) {
 	st := c.st
 
 	st.mu.Lock()
-	defer st.mu.Unlock()
 
-	for len(st.readBuf) == 0 && st.readErr == nil && st.s.ctx.Err() == nil && !st.closed {
+	for st.readBytes == 0 && st.readErr == nil && st.s.ctx.Err() == nil && !st.closed.Load() {
 		st.readCond.Wait()
 	}
 
-	if len(st.readBuf) == 0 {
+	if st.readBytes == 0 {
 		if st.readErr != nil {
+			st.mu.Unlock()
 			return 0, st.readErr
 		}
-		if st.closed {
+		if st.closed.Load() {
+			st.mu.Unlock()
 			return 0, fmt.Errorf("stream closed")
 		}
-		return 0, st.s.ctx.Err()
+		err := st.s.ctx.Err()
+		st.mu.Unlock()
+		return 0, err
 	}
 
-	n := copy(b, st.readBuf)
-	st.readBuf = st.readBuf[n:]
+	n := 0
+	for n < len(b) && len(st.readQ) > 0 {
+		head := &st.readQ[0]
+		copied := copy(b[n:], head.buf[head.off:])
+		n += copied
+		st.readBytes -= copied
+		head.off += copied
+
+		if head.off == len(head.buf) {
+			putDataFrameBuf(head.buf)
+			st.readQ[0] = readChunk{}
+			st.readQ = st.readQ[1:]
+		}
+	}
+	st.spaceCond.Broadcast()
+	st.mu.Unlock()
+
+	c.addRecvWindow(n)
 	return n, nil
 }
 
@@ -467,7 +487,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 	for len(b) > 0 {
 		s.mu.Lock()
 		for st.sendWin <= 0 || s.connSendWin <= 0 {
-			if st.closed || s.closed {
+			if st.closed.Load() || s.closed {
 				s.mu.Unlock()
 				return total, fmt.Errorf("connection closed")
 			}
@@ -506,9 +526,10 @@ func (c *Conn) Close() error {
 		st := c.st
 		s := st.s
 
+		st.closed.Store(true)
 		st.mu.Lock()
-		st.closed = true
 		st.readCond.Broadcast()
+		st.spaceCond.Broadcast()
 		st.mu.Unlock()
 
 		s.mu.Lock()
@@ -525,6 +546,57 @@ func (c *Conn) Close() error {
 		}
 	})
 	return err
+}
+
+func (c *Conn) addRecvWindow(n int) {
+	if n <= 0 {
+		return
+	}
+	st := c.st
+	s := st.s
+
+	var streamInc uint32
+	st.mu.Lock()
+	st.recvConsumed += int32(n)
+	if st.recvConsumed >= streamWinUpdateThresh {
+		streamInc = uint32(st.recvConsumed)
+		st.recvConsumed = 0
+	}
+	st.mu.Unlock()
+
+	var connInc uint32
+	s.mu.Lock()
+	s.connRecvConsumed += int32(n)
+	if s.connRecvConsumed >= connWinUpdateThresh {
+		connInc = uint32(s.connRecvConsumed)
+		s.connRecvConsumed = 0
+	}
+	s.mu.Unlock()
+
+	if connInc > 0 || streamInc > 0 {
+		s.framerMu.Lock()
+		if connInc > 0 {
+			s.framer.WriteWindowUpdate(0, connInc)
+		}
+		if streamInc > 0 {
+			s.framer.WriteWindowUpdate(st.id, streamInc)
+		}
+		s.framerMu.Unlock()
+	}
+}
+
+func getDataFrameBuf(size int) []byte {
+	if size > maxFrameSize {
+		return make([]byte, size)
+	}
+	return dataFrameBufPool.Get().([]byte)[:size]
+}
+
+func putDataFrameBuf(buf []byte) {
+	if cap(buf) < maxFrameSize {
+		return
+	}
+	dataFrameBufPool.Put(buf[:maxFrameSize])
 }
 
 func Dial(proxyAddr, targetAddr string) (*Conn, error) {

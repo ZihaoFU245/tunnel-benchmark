@@ -5,7 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
-	"sync"
+	"net"
+	"sync/atomic"
 	"time"
 
 	"stresstest/internal/h2conn"
@@ -41,9 +42,7 @@ func NewTunnel(config Config) *Tunnel {
 	return &Tunnel{
 		id:     config.ID,
 		config: config,
-		stats: &Stats{
-			RTTs: make([]float64, 0, 10000),
-		},
+		stats:  &Stats{},
 	}
 }
 
@@ -59,9 +58,14 @@ type tunnelConn interface {
 
 const maxRTTEntries = 65536
 
+type sentSlot struct {
+	seq      atomic.Uint64
+	unixNano atomic.Int64
+}
+
 func (t *Tunnel) Run(ctx context.Context) error {
-	t.stats.Start = time.Now()
-	defer func() { t.stats.End = time.Now() }()
+	t.stats.MarkStart(time.Now())
+	defer func() { t.stats.MarkEnd(time.Now()) }()
 
 	var conn tunnelConn
 	var packetSize, hdrSize int
@@ -94,30 +98,20 @@ func (t *Tunnel) Run(ctx context.Context) error {
 		hdrSize = h2conn.PacketHeaderSize()
 	}
 
-	payload := make([]byte, packetSize-hdrSize)
 	rng := rand.New(rand.NewSource(int64(t.id*1234567 + 1)))
-	for i := range payload {
-		payload[i] = byte(rng.Intn(256))
-	}
-
 	packet := make([]byte, packetSize)
-	copy(packet[hdrSize:], payload)
-
-	bytesPerSec := int(t.config.RateMbps * 125000)
-	packetInterval := time.Second / time.Duration(bytesPerSec/packetSize)
-	if packetInterval < 50*time.Microsecond {
-		packetInterval = 50 * time.Microsecond
+	for i := hdrSize; i < len(packet); i++ {
+		packet[i] = byte(rng.Intn(256))
 	}
+
+	packetsPerSec := t.config.RateMbps * 125000 / float64(packetSize)
+	packetInterval, packetsPerTick := pacing(packetsPerSec)
 
 	ticker := time.NewTicker(packetInterval)
 	defer ticker.Stop()
 
 	var seq uint32
-	rttMap := make(map[uint32]time.Time, maxRTTEntries)
-	var rttMu sync.Mutex
-
-	readBuf := make([]byte, packetSize*4)
-	readPos := 0
+	sent := make([]sentSlot, maxRTTEntries)
 
 	sendDone := make(chan struct{})
 	recvDone := make(chan struct{})
@@ -126,6 +120,7 @@ func (t *Tunnel) Run(ctx context.Context) error {
 
 	go func() {
 		defer close(sendDone)
+		var duePackets float64
 		for {
 			select {
 			case <-ctx.Done():
@@ -133,73 +128,92 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			case <-ticker.C:
 			}
 
-			now := time.Now()
-			binary.BigEndian.PutUint32(packet[0:4], seq)
-			binary.BigEndian.PutUint32(packet[4:8], uint32(now.UnixMilli()))
-
-			rttMu.Lock()
-			if len(rttMap) < maxRTTEntries {
-				rttMap[seq] = now
+			duePackets += packetsPerTick
+			sendCount := int(duePackets)
+			if sendCount == 0 {
+				continue
 			}
-			rttMu.Unlock()
-			seq++
+			duePackets -= float64(sendCount)
 
-			n, err := conn.Write(packet)
-			if n > 0 {
-				t.stats.AddSent(int64(n))
-			}
-			if err != nil {
-				sendErr = err
-				return
+			for i := 0; i < sendCount; i++ {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				now := time.Now()
+				binary.BigEndian.PutUint32(packet[0:4], seq)
+
+				idx := seq & (maxRTTEntries - 1)
+				sent[idx].unixNano.Store(now.UnixNano())
+				sent[idx].seq.Store(uint64(seq) + 1)
+				seq++
+
+				n, err := conn.Write(packet)
+				if n > 0 {
+					t.stats.AddSent(int64(n))
+				}
+				if err != nil {
+					sendErr = err
+					return
+				}
 			}
 		}
 	}()
 
 	go func() {
 		defer close(recvDone)
-		tmp := make([]byte, packetSize)
-		for {
-			n, err := conn.Read(tmp)
-			if err != nil {
-				recvErr = err
-				// Process any remaining complete packets before exit
-				rttMu.Lock()
-				for readPos >= packetSize {
-					rcvSeq := binary.BigEndian.Uint32(readBuf[0:4])
-					if sentTime, ok := rttMap[rcvSeq]; ok {
-						rttMu.Unlock()
-						rtt := time.Since(sentTime)
-						t.stats.RecordRTT(rtt)
-						rttMu.Lock()
-						delete(rttMap, rcvSeq)
-					}
-					copy(readBuf, readBuf[packetSize:readPos])
-					readPos -= packetSize
-				}
-				rttMu.Unlock()
+		tmp := make([]byte, packetSize*32)
+		partial := make([]byte, packetSize)
+		partialLen := 0
+
+		processPacket := func(pkt []byte) {
+			rcvSeq := binary.BigEndian.Uint32(pkt[0:4])
+			idx := rcvSeq & (maxRTTEntries - 1)
+			expected := uint64(rcvSeq) + 1
+
+			if sent[idx].seq.Load() != expected {
 				return
 			}
-			if n == 0 {
-				continue
+			sentAt := sent[idx].unixNano.Load()
+			if sentAt == 0 {
+				return
 			}
+			if sent[idx].seq.CompareAndSwap(expected, 0) {
+				t.stats.RecordRTT(time.Duration(time.Now().UnixNano() - sentAt))
+			}
+		}
 
-			copy(readBuf[readPos:], tmp[:n])
-			readPos += n
-			t.stats.AddRecv(int64(n))
+		for {
+			n, err := conn.Read(tmp)
+			if n > 0 {
+				t.stats.AddRecv(int64(n))
+				chunk := tmp[:n]
 
-			for readPos >= packetSize {
-				rcvSeq := binary.BigEndian.Uint32(readBuf[0:4])
+				for len(chunk) > 0 {
+					if partialLen == 0 && len(chunk) >= packetSize {
+						processPacket(chunk[:packetSize])
+						chunk = chunk[packetSize:]
+						continue
+					}
 
-				rttMu.Lock()
-				if sentTime, ok := rttMap[rcvSeq]; ok {
-					rtt := time.Since(sentTime)
-					t.stats.RecordRTT(rtt)
-					delete(rttMap, rcvSeq)
+					need := packetSize - partialLen
+					if need > len(chunk) {
+						copy(partial[partialLen:], chunk)
+						partialLen += len(chunk)
+						break
+					}
+
+					copy(partial[partialLen:], chunk[:need])
+					processPacket(partial)
+					partialLen = 0
+					chunk = chunk[need:]
 				}
-				rttMu.Unlock()
-
-				copy(readBuf, readBuf[packetSize:readPos])
-				readPos -= packetSize
+			}
+			if err != nil {
+				recvErr = err
+				return
 			}
 		}
 	}()
@@ -225,11 +239,28 @@ func (t *Tunnel) Run(ctx context.Context) error {
 	return nil
 }
 
+func pacing(packetsPerSec float64) (time.Duration, float64) {
+	if packetsPerSec <= 0 {
+		return time.Second, 1
+	}
+	if packetsPerSec < 1000 {
+		return time.Duration(float64(time.Second) / packetsPerSec), 1
+	}
+	interval := time.Millisecond
+	if packetsPerSec > 100000 {
+		interval = 100 * time.Microsecond
+	}
+	return interval, packetsPerSec * interval.Seconds()
+}
+
 func isConnClosed(err error) bool {
 	if err == nil {
 		return true
 	}
 	if err == context.Canceled {
+		return true
+	}
+	if e, ok := err.(net.Error); ok && e.Timeout() {
 		return true
 	}
 	s := err.Error()

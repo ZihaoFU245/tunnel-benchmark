@@ -24,7 +24,7 @@ func PrintReport(agg *tunnel.AggregateStats, transport string) {
 
 	fmt.Fprintf(w, "  Tunnels:\t%d\n", agg.TunnelCount)
 	fmt.Fprintf(w, "  Duration:\t%v\n", agg.Duration)
-	fmt.Fprintf(w, "  Samples:\t%d\n", len(agg.TotalRTTs))
+	fmt.Fprintf(w, "  Samples:\t%d\n", agg.TotalSamples)
 	fmt.Fprintf(w, "  Errors:\t%d\n", agg.TotalErrors)
 	fmt.Fprintln(w, "")
 
