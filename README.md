@@ -41,78 +41,41 @@ For Nginx
 
 ```txt
 Starting stress test
-
   Tunnels:   100
-
   Rate:      1.00 Mbps per tunnel
-
   Duration:  30s
-
   Proxy:     127.0.0.1:3128
-
   Target:    127.0.0.1:8080
-
   Transport: HTTP/2
-
   Mode:      single TCP connection (h2 multiplex)
 
 
-
-
-
 ═══════════════════════════════════════════════════════════
-
   HTTP/2 CONNECT TUNNEL STRESS TEST REPORT
-
 ═══════════════════════════════════════════════════════════
-
-
 
   Tunnels:   100
-
-  Duration:  29.997971529s
-
-  Samples:   266137
-
+  Duration:  29.994684746s
+  Samples:   266058
   Errors:    0
 
-
-
-  Bytes Sent:  357.4 MB
-
-  Bytes Recv:  357.4 MB
-
-  Throughput:  99.94 Mbps
-
-
+  Bytes Sent:  357.3 MB
+  Bytes Recv:  357.3 MB
+  Throughput:  99.91 Mbps
 
   ─────────── Latency (ms) ───────────
 
-
-
-  Min:  0.024
-
-  Max:  7.262
-
-  Avg:  0.392
-
-  P50:  0.334
-
-  P95:  0.841
-
+  Min:  0.025
+  Max:  2.553
+  Avg:  0.456
+  P50:  0.421
+  P95:  0.903
   P98:  1.100
-
   P99:  1.200
 
-
-
-  Tail 5% Avg:       1.064
-
-  Tail 2% Avg:       1.272
-
-  Latency Variance:  0.249
-
-
+  Tail 5% Avg:       1.081
+  Tail 2% Avg:       1.247
+  Latency Variance:  0.258
 
 ═══════════════════════════════════════════════════════════
 ```
